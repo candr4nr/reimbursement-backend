@@ -62,3 +62,16 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server berjalan di http://localhost:${PORT}`);
 });
+
+// debug
+const fs = require("fs");
+
+app.get("/debug/uploads", (req, res) => {
+  const uploadDir = path.join(__dirname, "public/uploads");
+
+  res.json({
+    uploadDir,
+    exists: fs.existsSync(uploadDir),
+    files: fs.existsSync(uploadDir) ? fs.readdirSync(uploadDir) : []
+  });
+});
