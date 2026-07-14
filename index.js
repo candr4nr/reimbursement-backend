@@ -47,6 +47,21 @@ app.get('/', (req, res) => {
   res.json({ message: 'Reimburse API root. Gunakan /api untuk endpoint utama.' });
 });
 
+// DEBUG
+const fs = require("fs");
+
+app.get("/debug/uploads", (req, res) => {
+  const uploadDir = path.join(__dirname, "public/uploads");
+
+  res.json({
+    uploadDir,
+    exists: fs.existsSync(uploadDir),
+    files: fs.existsSync(uploadDir)
+      ? fs.readdirSync(uploadDir)
+      : []
+  });
+});
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ message: `Route ${req.method} ${req.path} tidak ditemukan` });
@@ -61,17 +76,4 @@ app.use((err, req, res, next) => {
 // ─── Start server ─────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`🚀 Server berjalan di http://localhost:${PORT}`);
-});
-
-// debug
-const fs = require("fs");
-
-app.get("/debug/uploads", (req, res) => {
-  const uploadDir = path.join(__dirname, "public/uploads");
-
-  res.json({
-    uploadDir,
-    exists: fs.existsSync(uploadDir),
-    files: fs.existsSync(uploadDir) ? fs.readdirSync(uploadDir) : []
-  });
 });
