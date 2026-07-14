@@ -2,26 +2,47 @@
 //
 // REFACTOR: seluruh logika parsing (nama toko, tanggal, total, items)
 // SUDAH DIPINDAH ke services/coordinateParser.js (parser koordinat +
-// regex fallback). Controller ini TIDAK BOLEH lagi berisi regex parsing
-// sendiri — kalau butuh field baru atau perbaikan akurasi, edit di
-// services/storeParser.js / dateParser.js / totalParser.js / itemParser.js
-// / regexFallbackParser.js, BUKAN di sini.
+// regex fallback + LLM fallback). Controller ini TIDAK BOLEH lagi berisi
+// regex parsing sendiri — kalau butuh field baru atau perbaikan akurasi,
+// edit di services/storeParser.js / dateParser.js / totalParser.js /
+// itemParser.js / discountTaxParser.js / regexFallbackParser.js /
+// llmFallbackParser.js, BUKAN di sini.
 //
 // Controller hanya bertanggung jawab atas: validasi request, memanggil
 // parser, dan menyimpan/membaca dari database (PostgreSQL, via `pg`).
 
 const pool = require('../config/db');
-const { parseReceipt } = require('../services/coordinateParser');
+const { parseReceiptLlmFirst } = require('../services/coordinateParser');
 
 // ─── POST /api/ocr/parse ───────────────────────────────────────────────
 // Body: { raw_text, lines? }
 //   raw_text : string, teks OCR mentah (WAJIB)
 //   lines    : Array<OcrLine>, hasil bounding box dari ML Kit (OPSIONAL —
-//              kalau tidak dikirim/kosong, parser tetap jalan berbasis
-//              baris dari raw_text, lihat lineGrouper.groupLinesFromRawText)
+//              kalau tidak dikirim/kosong, parser lokal (jaring pengaman)
+//              tetap jalan berbasis baris dari raw_text, lihat
+//              lineGrouper.groupLinesFromRawText)
 //
-// Return: { success, data: { raw_text, nama_toko, tanggal, items, total, meta } }
-exports.parseOcr = (req, res) => {
+// Parsing sekarang LLM-first (lihat parseReceiptLlmFirst di
+// coordinateParser.js): rawText dikirim ke Gemini dulu untuk SEMUA struk;
+// kalau Gemini gagal/tidak tersedia/kuota habis, otomatis fallback ke
+// parser koordinat+regex lokal (tidak pernah return kosong total kalau
+// parser lokal masih bisa menemukan sesuatu). Karena ada panggilan
+// network ke LLM, handler ini WAJIB async — jangan hapus `await`-nya.
+//
+// Kalau nanti kuota free tier Gemini sering kena limit (mis. banyak
+// karyawan submit bareng di akhir bulan), tinggal ganti import di atas ke
+// `parseReceiptWithLlmFallback` (LLM cuma dipanggil untuk struk yang
+// confidence-nya rendah) TANPA perlu ubah apa pun di bawah ini.
+//
+// Return: { success, data: { raw_text, nama_toko, tanggal, diskon, pajak,
+//                             items, total, meta } }
+//
+// CATATAN FIX: sebelumnya `hasil.diskon` & `hasil.pajak` (yang sudah
+// dihitung oleh coordinateParser.js lewat discountTaxParser.js) TIDAK
+// diteruskan ke response `data` di sini — field-nya hilang di controller
+// walau parser sudah berhasil mendeteksinya. Ditambahkan di bawah supaya
+// nominal diskon/pajak sampai ke frontend.
+exports.parseOcr = async (req, res) => {
   try {
     const { raw_text, lines } = req.body;
 
@@ -29,7 +50,7 @@ exports.parseOcr = (req, res) => {
       return res.status(400).json({ success: false, message: 'raw_text wajib diisi' });
     }
 
-    const hasil = parseReceipt({ rawText: raw_text, lines });
+    const hasil = await parseReceiptLlmFirst({ rawText: raw_text, lines });
 
     res.json({
       success: true,
@@ -38,11 +59,15 @@ exports.parseOcr = (req, res) => {
         raw_text,
         nama_toko: hasil.namaToko,
         tanggal: hasil.tanggal,
+        diskon: hasil.diskon,
+        pajak: hasil.pajak,
         items: hasil.items,
         total: hasil.total,
-        // meta.source menandai asal tiap field ('coordinate' | 'regex' | null).
-        // Berguna untuk debugging & analisis akurasi (skripsi), boleh
-        // diabaikan/dibuang di frontend kalau tidak perlu ditampilkan.
+        // meta.source menandai asal tiap field ('llm' | 'coordinate' |
+        // 'regex' | null), dan meta.llmUsed/meta.llmFailed menandai apakah
+        // Gemini dipanggil & berhasil. Berguna untuk debugging & analisis
+        // akurasi (skripsi), boleh diabaikan/dibuang di frontend kalau
+        // tidak perlu ditampilkan.
         meta: hasil.meta,
       },
     });
@@ -58,6 +83,23 @@ exports.parseOcr = (req, res) => {
 //
 // ASUMSI SKEMA: kolom `reimbursement_id` di tabel `ocr_result` punya
 // UNIQUE/PRIMARY KEY constraint, supaya ON CONFLICT di bawah valid.
+//
+// Tidak berubah dari sebelumnya — saveOcr murni operasi database, tidak
+// menyentuh parser sama sekali (parsing sudah selesai & dikonfirmasi user
+// di endpoint /parse sebelum data ini dikirim ke sini).
+//
+// CATATAN soal diskon/pajak: baris "Diskon" dan "Pajak/Biaya Layanan"
+// sudah ikut disuntikkan sebagai baris item biasa di `items[]` oleh
+// coordinateParser.js (lihat appendDiscountTaxItems()), jadi kalau
+// frontend mengirim balik `items` apa adanya dari hasil /parse, nominal
+// diskon/pajak OTOMATIS ikut tersimpan lewat loop insert receipt_item di
+// bawah — tidak perlu kolom terpisah untuk itu.
+//
+// Kalau ke depannya kamu memang butuh kolom terpisah `diskon_amount` /
+// `pajak_amount` di tabel `ocr_result` (mis. untuk query/laporan tanpa
+// perlu filter nama_item = 'Diskon'), tinggal tambahkan kolomnya di
+// migration lalu masukkan `diskon`/`pajak` di sini dengan pola yang sama
+// seperti `total_amount` di bawah.
 exports.saveOcr = async (req, res) => {
   const client = await pool.connect();
   try {

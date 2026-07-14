@@ -1,5 +1,5 @@
-const { Pool } = require('pg');
 require('dotenv').config();
+const { Pool } = require('pg');
 
 const pool = new Pool({
   host: process.env.DB_HOST,
@@ -12,12 +12,12 @@ const pool = new Pool({
   },
 });
 
-pool.connect((err) => {
-  if (err) {
+pool.connect()
+  .then(() => {
+    console.log('✅ Terhubung ke PostgreSQL (Neon)');
+  })
+  .catch((err) => {
     console.error('❌ Gagal koneksi ke PostgreSQL:', err.message);
-  } else {
-    console.log('✅ Terhubung ke PostgreSQL');
-  }
-});
+  });
 
 module.exports = pool;

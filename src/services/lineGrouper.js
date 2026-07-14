@@ -81,14 +81,34 @@ function groupLines(rawLines, options = {}) {
 
   const groups = [];
   let currentGroup = null;
+  // Jangkar row = Y token PERTAMA yang masuk grup (BUKAN rata-rata berjalan
+  // dari seluruh anggota grup sejauh ini).
+  //
+  // KENAPA DIUBAH dari rata-rata berjalan: rata-rata berjalan rentan
+  // "chaining" — baris A & baris C yang sebenarnya TIDAK berhubungan bisa
+  // ikut tergabung kalau ada baris B "penjembatan" di antaranya yang
+  // masing-masing masih dalam threshold ke tetangganya, padahal jarak A ke
+  // C sendiri sudah jauh melebihi threshold. Kasus nyata yang ditemukan:
+  // struk dengan token "RP" berdiri sendiri (terpisah dari label MAUPUN
+  // nominalnya sendiri, mis. hasil deteksi ML Kit yang memecah "RP 80.000"
+  // jadi 2 elemen terpisah) di antara baris "SUBTOTAL ... RP 80.000" dan
+  // baris "DISCOUNT : RP ... 20.000" — token "RP" itu ikut tertarik ke
+  // baris DISCOUNT lewat rata-rata berjalan, MENCURI nominal 80.000 dari
+  // SUBTOTAL sebagai (seolah-olah) nominal diskon, sementara nominal
+  // diskon yang benar (20.000) malah terlempar jadi baris terpisah.
+  //
+  // Pakai jangkar TETAP (Y token pertama) mencegah chaining semacam ini,
+  // karena SETIAP anggota baru harus tetap dekat ke titik AWAL grup, bukan
+  // ke rata-rata yang terus bergeser. Trade-off: baris yang sangat miring
+  // (foto struk dari sudut ekstrem) dengan >2-3 token bisa "lepas" di
+  // tengah kalau driftnya kumulatif > threshold — tapi ini jauh lebih
+  // jarang terjadi dibanding kasus "beberapa label ringkasan pendek
+  // bertumpuk rapat" yang ditemukan di atas, jadi trade-off ini diterima.
   let currentAnchorY = null;
 
   for (const line of sorted) {
     if (currentGroup && Math.abs(line.y - currentAnchorY) < threshold) {
       currentGroup.push(line);
-      // Anchor dihitung ulang sebagai rata-rata berjalan supaya row yang agak
-      // miring tidak "lepas" hanya karena dibandingkan ke token pertama saja.
-      currentAnchorY = currentGroup.reduce((sum, l) => sum + l.y, 0) / currentGroup.length;
     } else {
       if (currentGroup) groups.push(currentGroup);
       currentGroup = [line];

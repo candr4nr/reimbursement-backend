@@ -138,23 +138,78 @@ const update = async (req, res) => {
   }
 };
 
-// DELETE user
+// DELETE user — hapus akun beserta seluruh riwayat reimburse-nya
+//
+// Struktur relasi:
+//   reimbursement (user_id NOT NULL, FK ke "user")
+//     ├── approval        (reimbursement_id)
+//     ├── ReceiptImage     (reimbursement_id)
+//     ├── OCRResult        (reimbursement_id)
+//     ├── CNNResult        (reimbursement_id)
+//     └── ReceiptItem      (reimbursement_id)
+//
+// Kelima tabel anak di atas sama-sama langsung refer ke reimbursement_id
+// (bukan bertingkat/saling terkait), jadi urutan hapus di antara mereka
+// tidak masalah — yang penting SEMUANYA dihapus sebelum baris reimburse,
+// dan reimburse dihapus sebelum baris user.
+//
+// CATATAN:
+// - Kode ini mengasumsikan db.js meng-ekspor pool `pg` sehingga
+//   `db.connect()` tersedia untuk membuka satu koneksi transaksi.
+//   Kalau db.js kamu HANYA mengekspor fungsi query() (bukan pool asli),
+//   tambahkan export pool di config/db.js, contoh:
+//
+//     const { Pool } = require('pg');
+//     const pool = new Pool({ ... });
+//     module.exports = pool;
+//     // lalu di file lain: db.query(...) dan db.connect() sama-sama valid
+//
+// - Sesuaikan nama tabel persis dengan yang ada di database kamu
+//   (huruf besar/kecil PostgreSQL sensitif kalau tabel dibuat dengan
+//   quoted identifier, contoh "ReceiptImage" vs receiptimage).
 const remove = async (req, res) => {
+  const client = await db.connect();
   try {
     const { id } = req.params;
 
     if (parseInt(id) === req.user.userId)
       return res.status(400).json({ success: false, message: 'Tidak bisa menghapus akun sendiri' });
 
-    const result = await db.query(
-      'DELETE FROM "user" WHERE user_id = $1 RETURNING user_id, name',
-      [id]
-    );
-    if (result.rows.length === 0)
+    const userCheck = await client.query('SELECT user_id, name FROM "user" WHERE user_id = $1', [id]);
+    if (userCheck.rows.length === 0)
       return res.status(404).json({ success: false, message: 'User tidak ditemukan' });
-    res.json({ success: true, message: `User ${result.rows[0].name} berhasil dihapus` });
+
+    const userName = userCheck.rows[0].name;
+
+    await client.query('BEGIN');
+
+    // Subquery reimbursement_id milik user ini, dipakai berulang di bawah
+    const reimburseIdsSubquery = 'SELECT reimbursement_id FROM reimbursement WHERE user_id = $1';
+
+    // 1. Hapus 5 tabel anak (urutan antar mereka bebas, tidak saling terkait)
+    await client.query(`DELETE FROM approval WHERE reimbursement_id IN (${reimburseIdsSubquery})`, [id]);
+    await client.query(`DELETE FROM "receipt_image" WHERE reimbursement_id IN (${reimburseIdsSubquery})`, [id]);
+    await client.query(`DELETE FROM "ocr_result" WHERE reimbursement_id IN (${reimburseIdsSubquery})`, [id]);
+    await client.query(`DELETE FROM "cnn_result" WHERE reimbursement_id IN (${reimburseIdsSubquery})`, [id]);
+    await client.query(`DELETE FROM "receipt_item" WHERE reimbursement_id IN (${reimburseIdsSubquery})`, [id]);
+
+    // 2. Baru hapus riwayat reimburse milik user ini
+    await client.query('DELETE FROM reimbursement WHERE user_id = $1', [id]);
+
+    // 3. Terakhir, hapus user-nya
+    await client.query('DELETE FROM "user" WHERE user_id = $1', [id]);
+
+    await client.query('COMMIT');
+
+    res.json({
+      success: true,
+      message: `User ${userName} beserta seluruh riwayat reimburse-nya berhasil dihapus`,
+    });
   } catch (err) {
+    await client.query('ROLLBACK');
     res.status(500).json({ success: false, message: err.message });
+  } finally {
+    client.release();
   }
 };
 

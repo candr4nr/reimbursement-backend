@@ -72,6 +72,10 @@ const login = async (req, res) => {
 // ─────────────────────────────────────────────────────────
 // POST /api/auth/forgot-password
 // Body: { email }
+// Response data.status dipakai frontend untuk menentukan apakah
+// ini aktivasi akun pertama kali (inactive) atau lupa password
+// biasa (active) — menentukan apakah step password sementara
+// perlu ditampilkan atau tidak.
 // ─────────────────────────────────────────────────────────
 const forgotPassword = async (req, res) => {
   const { email } = req.body;
@@ -82,7 +86,7 @@ const forgotPassword = async (req, res) => {
 
   try {
     const result = await pool.query(
-      'SELECT user_id FROM "user" WHERE email = $1',
+      'SELECT user_id, status FROM "user" WHERE email = $1',
       [email]
     );
 
@@ -100,7 +104,10 @@ const forgotPassword = async (req, res) => {
 
     await sendOTPEmail(email, otp);
 
-    return res.json({ message: 'OTP berhasil dikirim ke email' });
+    return res.json({
+      message: 'OTP berhasil dikirim ke email',
+      data: { status: result.rows[0].status },
+    });
   } catch (err) {
     console.error('Forgot password error:', err);
     return res.status(500).json({ message: 'Terjadi kesalahan server' });
@@ -184,26 +191,38 @@ const resendOTP = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────
 // POST /api/auth/reset-password
-// Body: { email, otp_code, new_password }
+// Body: { email, otp_code, temp_password, new_password }
 // Dipakai untuk: forgot password & aktivasi akun
+//
+// temp_password: password yang dikirim admin lewat email saat akun
+// karyawan pertama kali dibuat (lihat sendAccountEmail() di
+// userController.js). Ini jadi lapisan verifikasi TAMBAHAN di
+// samping OTP — user harus tahu OTP (bukti akses ke email saat ini)
+// DAN password sementara asli (bukti dia penerima akun yang sah),
+// sebelum boleh set password baru.
 // ─────────────────────────────────────────────────────────
 const resetPassword = async (req, res) => {
-  const { email, otp_code, new_password } = req.body;
+  const { email, otp_code, temp_password, new_password } = req.body;
 
   if (!email || !otp_code || !new_password) {
-    return res.status(400).json({ message: 'Email, OTP, dan password baru wajib diisi' });
+    return res.status(400).json({
+      message: 'Email, OTP, dan password baru wajib diisi',
+    });
   }
 
   try {
-    // Validasi OTP sekali lagi
     const result = await pool.query(
-      `SELECT otp_code, otp_expired_at FROM "user" WHERE email = $1`,
+      `SELECT otp_code, otp_expired_at, password, status FROM "user" WHERE email = $1`,
       [email]
     );
 
     const user = result.rows[0];
 
-    if (!user || user.otp_code !== otp_code) {
+    if (!user) {
+      return res.status(404).json({ message: 'Email tidak terdaftar' });
+    }
+
+    if (user.otp_code !== otp_code) {
       return res.status(400).json({ message: 'OTP tidak valid' });
     }
 
@@ -211,9 +230,18 @@ const resetPassword = async (req, res) => {
       return res.status(400).json({ message: 'OTP sudah expired, minta OTP baru' });
     }
 
+    if (user.status === 'inactive') {
+      if (!temp_password) {
+        return res.status(400).json({ message: 'Password sementara wajib diisi' });
+      }
+      const isTempPasswordValid = await bcrypt.compare(temp_password, user.password);
+      if (!isTempPasswordValid) {
+        return res.status(400).json({ message: 'Password sementara tidak sesuai' });
+      }
+    }
+
     const hashed = await bcrypt.hash(new_password, 10);
 
-    // Reset password + hapus OTP + aktifkan akun (handle aktivasi & forgot password sekaligus)
     await pool.query(
       `UPDATE "user"
        SET password = $1, status = 'active', otp_code = NULL, otp_expired_at = NULL

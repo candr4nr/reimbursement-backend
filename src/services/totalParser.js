@@ -22,20 +22,59 @@ const {
   getTokensRightOfX,
 } = require('./lineGrouper');
 
-const { parseNominal } = require('./normalizer');
+const { parseNominal, buildNominalTokenRegex } = require('./normalizer');
 
 // ─── Konfigurasi label ─────────────────────────────────────────────────────
 
 const GRAND_TOTAL_REGEX = /\bGRAND\s*TOTAL\b/i;
 const TOTAL_REGEX = /\bTOTAL\b/i;
-const EXCLUDE_REGEX = /\b(SUB\s*TOTAL|TAX|PPN|DISCOUNT|DISKON|CHANGE|KEMBALI|CASH|TUNAI)\b/i;
+
+// ── Exclude, dipecah jadi dua tingkat ──────────────────────────────────
+//
+// HARD_EXCLUDE: field yang JELAS beda dari total akhir meski baris ini
+// lolos TOTAL_REGEX (karena "SUB TOTAL" mengandung substring "TOTAL" yang
+// dipisah spasi). Selalu exclude, tidak ada pengecualian.
+const HARD_EXCLUDE_REGEX = /\bSUB\s*TOTAL\b/i;
+
+// SOFT_EXCLUDE: kata yang BISA menandakan baris ini sebenarnya baris
+// komponen terpisah (mis. "Total PPN 4.700" = subtotal pajak, bukan total
+// akhir), TAPI kata yang sama juga sering muncul di baris TOTAL asli
+// sekadar sebagai keterangan ("TOTAL (SUDAH TERMASUK PPN)  47000"). Jadi
+// TIDAK langsung exclude begitu kata ini ketemu di mana pun dalam baris —
+// hanya exclude kalau kemunculannya BUKAN didahului frasa "termasuk/incl"
+// (lihat isDisqualifyingRow()).
+const SOFT_EXCLUDE_REGEX = /\b(TAX|PPN|PAJAK|DISKON|DISCOUNT|CASH|TUNAI|CHANGE|KEMBALI)\b/i;
+
+// Frasa yang menandakan kata SOFT_EXCLUDE di dekatnya cuma keterangan
+// "sudah termasuk", bukan label baris tersendiri.
+const INCLUSIVE_QUALIFIER_REGEX = /\b(SUDAH\s*)?TERMASUK\b|\bINCL\.?\b|\bINCLUDED?\b/i;
 
 // Threshold Y untuk mencari row "sejajar" saat label & value terpisah row.
 const Y_ALIGN_THRESHOLD = 15;
 
-// Pola nominal generik: angka dengan opsional pemisah ribuan/desimal,
-// opsional diawali "Rp". Dipakai untuk cari kandidat angka di sebuah string.
-const NOMINAL_REGEX = /(?:Rp\.?\s*)?\d[\d.,]*\d|\d/g;
+/**
+ * Apakah baris ini sebaiknya DIABAIKAN sebagai kandidat TOTAL akhir?
+ *
+ * Strategi:
+ *   1. "SUB TOTAL" -> selalu exclude, field yang jelas berbeda.
+ *   2. Kata seperti PPN/TAX/DISKON -> exclude HANYA kalau kemunculannya
+ *      TIDAK didahului frasa "(sudah) termasuk" / "incl" / "included" di
+ *      baris yang sama. Baris "TOTAL (SUDAH TERMASUK PPN) 47000" tetap
+ *      diproses sebagai TOTAL asli; baris "Total PPN  4.700" tetap
+ *      dianggap komponen terpisah dan di-exclude.
+ */
+function isDisqualifyingRow(text) {
+  if (!text) return false;
+  if (HARD_EXCLUDE_REGEX.test(text)) return true;
+
+  const softMatch = text.match(SOFT_EXCLUDE_REGEX);
+  if (!softMatch) return false;
+
+  const precedingText = text.slice(0, softMatch.index);
+  if (INCLUSIVE_QUALIFIER_REGEX.test(precedingText)) return false;
+
+  return true;
+}
 
 // ─── Util ──────────────────────────────────────────────────────────────────
 
@@ -47,7 +86,7 @@ const NOMINAL_REGEX = /(?:Rp\.?\s*)?\d[\d.,]*\d|\d/g;
  */
 function extractRightmostNominal(text) {
   if (!text) return null;
-  const matches = text.match(NOMINAL_REGEX);
+  const matches = text.match(buildNominalTokenRegex());
   if (!matches || matches.length === 0) return null;
 
   const lastMatch = matches[matches.length - 1];
@@ -84,6 +123,9 @@ function isPlausibleTotal(value) {
  * @returns {{raw:string, value:number}|null}
  */
 function extractValueForLabelRow(row, rows) {
+  const rowIndex = rows.indexOf(row);
+  const selfIndices = rowIndex >= 0 ? [rowIndex] : [];
+
   // 1. Coba token di kanan label pada row yang sama
   const labelEndX = getRightmostLabelTokenX(row, TOTAL_REGEX) ??
     getRightmostLabelTokenX(row, GRAND_TOTAL_REGEX);
@@ -93,14 +135,14 @@ function extractValueForLabelRow(row, rows) {
     const rightText = rightTokens.map((t) => t.text).join(' ');
     const value = extractRightmostNominal(rightText);
     if (value !== null && isPlausibleTotal(value)) {
-      return { raw: rightText.trim() || row.text, value };
+      return { raw: rightText.trim() || row.text, value, lineIndices: selfIndices };
     }
   }
 
   // 2. Coba parse dari seluruh teks row (kalau token split-nya tidak rapi)
   const valueFromRow = extractRightmostNominal(row.text);
   if (valueFromRow !== null && isPlausibleTotal(valueFromRow)) {
-    return { raw: row.text, value: valueFromRow };
+    return { raw: row.text, value: valueFromRow, lineIndices: selfIndices };
   }
 
   // 3. Row lain yang Y-nya sejajar dengan row label
@@ -108,7 +150,9 @@ function extractValueForLabelRow(row, rows) {
   for (const r of nearby) {
     const value = extractRightmostNominal(r.text);
     if (value !== null && isPlausibleTotal(value)) {
-      return { raw: r.text, value };
+      const nearbyIndex = rows.indexOf(r);
+      const lineIndices = nearbyIndex >= 0 ? [...selfIndices, nearbyIndex] : selfIndices;
+      return { raw: r.text, value, lineIndices };
     }
   }
 
@@ -128,7 +172,7 @@ function parseTotal(rows) {
 
   // 1. Prioritas: GRAND TOTAL
   const grandTotalRows = findRowsByKeyword(rows, GRAND_TOTAL_REGEX)
-    .filter(({ row }) => !EXCLUDE_REGEX.test(row.text.replace(GRAND_TOTAL_REGEX, '')));
+    .filter(({ row }) => !isDisqualifyingRow(row.text.replace(GRAND_TOTAL_REGEX, '')));
 
   for (const { row } of grandTotalRows) {
     const result = extractValueForLabelRow(row, rows);
@@ -139,7 +183,7 @@ function parseTotal(rows) {
   //    SUBTOTAL/TAX/DISCOUNT/CASH/dll (kata-kata itu sering mengandung
   //    substring lain yang bisa salah kena regex label lain).
   const totalRows = findRowsByKeyword(rows, TOTAL_REGEX)
-    .filter(({ row }) => !EXCLUDE_REGEX.test(row.text));
+    .filter(({ row }) => !isDisqualifyingRow(row.text));
 
   for (const { row } of totalRows) {
     const result = extractValueForLabelRow(row, rows);
@@ -154,4 +198,5 @@ module.exports = {
   parseTotal,
   extractRightmostNominal,
   isPlausibleTotal,
+  isDisqualifyingRow,
 };

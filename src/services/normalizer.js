@@ -33,6 +33,15 @@ const KNOWN_OCR_FIXES = {
   'larg3': 'Large',
   'disk0n': 'Diskon',
   'p4jak': 'Pajak',
+  // Singkatan "Jl." (Jalan) di awal baris alamat. "L" pada singkatan ini
+  // pendek & sering salah baca ML Kit jadi digit yang bentuknya mirip:
+  //   "J1." -> L dibaca sebagai angka 1
+  //   "JI." -> L dibaca sebagai huruf I (kapital I mirip L di banyak font)
+  // Dikoreksi di sini (bukan di regex ADDRESS_PATTERNS) supaya satu
+  // perbaikan ini otomatis kepakai di SEMUA tempat yang membaca row.text
+  // (storeParser, itemParser, dateParser, dll), bukan cuma exclude alamat.
+  'j1': 'Jl',
+  'ji': 'Jl',
 };
 
 // Daftar kata "aman" (whitelist) yang sering muncul di struk. Dipakai
@@ -328,11 +337,65 @@ function normalizeYear(yearInput, toleranceYears = 1, maxYearsBack = 15) {
   return String(currentYear);
 }
 
+// ─── Pola token nominal (dipakai bersama itemParser.js & regexFallbackParser.js) ──
+
+// Fragmen regex (TANPA anchor/lookaround) untuk "satu angka" yang bisa
+// punya pemisah ribuan berupa titik, koma, ATAU SATU spasi — mis. hasil
+// ketik manual/OCR yang merender pemisah ribuan sebagai spasi ("14 000").
+//
+// Kenapa spasi TUNGGAL aman dipakai sebagai bagian dari angka (bukan gap
+// kolom): lineGrouper.js sudah membedakan ini di levelnya sendiri — gap
+// antar kolom yang lebar (>=3 karakter) selalu dikonversi jadi 3 spasi,
+// sementara gap sempit (mis. dalam satu angka/kata) jadi 1 spasi (lihat
+// buildRow() di lineGrouper.js). Jadi "\s{2,}" tetap aman dipakai di
+// tempat lain sebagai pemisah KOLOM, sedangkan SATU spasi di antara dua
+// kelompok 3-digit di sini dianggap bagian dari angka yang sama.
+//
+// Catatan: kasus langka "qty 1 digit + harga tepat 3 digit dengan gap
+// sempit" (mis. "2 500" dibaca sebagai satu angka 2500) bisa salah
+// gabung. Trade-off ini diterima karena kasus itu jauh lebih jarang
+// dibanding "14 000" gagal kebaca sebagai satu nominal.
+const NOMINAL_GROUP_SOURCE = '\\d+(?:[.,]\\d{3}|\\s\\d{3}(?![A-Za-z0-9]))*';
+
+/**
+ * Bangun regex GLOBAL untuk menemukan semua token nominal dalam sebuah
+ * string, termasuk yang pemisah ribuannya berupa spasi. Menolak angka
+ * yang menyatu langsung dengan huruf (satuan produk / kode alfanumerik),
+ * lewat lookbehind/lookahead di kedua sisi — sama seperti versi lama.
+ */
+function buildNominalTokenRegex() {
+  return new RegExp(
+    // Lookahead tambahan `%` (selain A-Za-z0-9): angka yang LANGSUNG
+    // diikuti '%' (boleh ada spasi di antaranya, makanya dicek di lookahead
+    // sebagai class char, bukan cuma nempel) adalah PERSENTASE (mis. potongan
+    // "Diskon 10%"), BUKAN nominal rupiah — kalau tidak dikecualikan, "10%"
+    // akan salah kebaca sebagai nominal "10" oleh discountTaxParser.js
+    // (baris diskon sering CUMA berisi persentase tanpa nominal absolut,
+    // beda dari baris pajak yang hampir selalu ada nominal Rp di baris yang
+    // sama) maupun itemParser.js kalau ada anotasi persen di baris item.
+    `(?<![A-Za-z0-9])(?:Rp\\.?\\s*)?${NOMINAL_GROUP_SOURCE}(?![A-Za-z0-9])(?!\\s*%)`,
+    'g'
+  );
+}
+
+/**
+ * Cek apakah SELURUH string (setelah trim) adalah satu token nominal yang
+ * valid — dipakai regexFallbackParser.js untuk mendeteksi "baris cuma
+ * angka" (mis. harga di baris terpisah dari nama item yang wrap).
+ */
+function isNominalToken(str) {
+  const re = new RegExp(`^(?:Rp\\.?\\s*)?${NOMINAL_GROUP_SOURCE}$`, 'i');
+  return re.test(String(str ?? '').trim());
+}
+
 module.exports = {
   normalizeText,
   normalizeWord,
   parseNominal,
   normalizeYear,
+  buildNominalTokenRegex,
+  isNominalToken,
+  NOMINAL_GROUP_SOURCE,
   // exported untuk keperluan testing / dipakai lineGrouper kalau perlu
   isLikelyWordToken,
   isLikelyNumericToken,

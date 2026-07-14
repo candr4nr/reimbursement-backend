@@ -4,7 +4,8 @@
 // gagal ditemukan parser koordinat (mis. lines kosong/tidak dikirim client lama,
 // atau layout struk yang belum tertangani parser bounding-box).
 
-const { parseNominal, normalizeYear } = require('./normalizer');
+const { parseNominal, normalizeYear, buildNominalTokenRegex, isNominalToken, NOMINAL_GROUP_SOURCE } = require('./normalizer');
+const { buildNonDataRegex } = require('./nonDataRows');
 
 // ─── Tanggal ───────────────────────────────────────────────────────────
 const parseTanggal = (text) => {
@@ -66,8 +67,16 @@ const parseTanggal = (text) => {
 const parseItems = (lines) => {
   const items = [];
 
-  const skipKeywords =
-    /total|grand|subtotal|diskon|discount|pajak|tax|ppn|service|charge|cash|tunai|change|kembali|kembalian|bayar|payment|void|struk|nota|invoice|terima kasih|thank|member|poin|point|no\.|nomor|tanggal|date|time|jam|kasir|cashier|toko|store|address|alamat|telp|phone|fax|channel|order\s*number|rounding|qpon|coupon|download|feedback|customer\s*care|best\s*seller/i;
+  // Basis pola sama dengan storeParser.js & itemParser.js (nonDataRows.js),
+  // ditambah kata kunci yang sebelumnya sudah ada di sini tapi belum masuk
+  // basis bersama (mis. "kembalian", "toko/store", "channel", dll) —
+  // dipertahankan sebagai pola tambahan spesifik fallback ini.
+  const skipKeywords = buildNonDataRegex([
+    'void', '\\bstruk\\b', 'kembalian', 'poin', '\\bpoint\\b',
+    'no\\.', 'nomor', '\\btoko\\b', '\\bstore\\b', '\\baddress\\b', '\\balamat\\b',
+    'channel', 'rounding', 'qpon', 'coupon', 'download', 'feedback',
+    'customer\\s*care', 'best\\s*seller',
+  ]);
 
   const isPlausibleItemName = (name) => {
     const trimmed = name.trim();
@@ -77,7 +86,7 @@ const parseItems = (lines) => {
   const isNumericRow = (line) => {
     const tokens = line.split(/\s{2,}/).map((t) => t.trim()).filter(Boolean);
     if (tokens.length === 0) return false;
-    return tokens.every((t) => /^[\d.,]+$/.test(t));
+    return tokens.every((t) => isNominalToken(t));
   };
 
   const isModifierLine = (line) => /^\+/.test(line.trim());
@@ -89,7 +98,14 @@ const parseItems = (lines) => {
     if (isModifierLine(trimmed)) continue;
     if (isNumericRow(trimmed)) continue;
 
-    let match = trimmed.match(/^(.+?)\s{2,}(\d+)\s{2,}([\d.,]+)\s{2,}([\d.,]+)\s*$/);
+    // Pola kolom harga di sini dibangun dari NOMINAL_GROUP_SOURCE (bukan
+    // hardcode `[\d.,]+`) supaya kolom harga yang pemisah ribuannya berupa
+    // SATU spasi (mis. "14 000") tetap kebaca sebagai satu angka, bukan
+    // dua kolom terpisah yang salah pairing.
+    const qtyPriceSubtotalRegex = new RegExp(
+      `^(.+?)\\s{2,}(\\d+)\\s{2,}(${NOMINAL_GROUP_SOURCE})\\s{2,}(${NOMINAL_GROUP_SOURCE})\\s*$`
+    );
+    let match = trimmed.match(qtyPriceSubtotalRegex);
     if (match && isPlausibleItemName(match[1])) {
       const qty = parseInt(match[2]) || 1;
       const hargaSatuan = parseNominal(match[3]);
@@ -100,7 +116,8 @@ const parseItems = (lines) => {
       }
     }
 
-    match = trimmed.match(/^(.+?)\s{2,}([\d.,]+)\s*$/);
+    const nameSubtotalRegex = new RegExp(`^(.+?)\\s{2,}(${NOMINAL_GROUP_SOURCE})\\s*$`);
+    match = trimmed.match(nameSubtotalRegex);
     const isShortNumber = match && /^\d{1,2}$/.test(match[2]);
     if (match && !isShortNumber && isPlausibleItemName(match[1])) {
       const subtotal = parseNominal(match[2]);
@@ -161,9 +178,9 @@ function extractByKeyword(lines, keywordRegex) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (keywordRegex.test(line)) {
-      let numbers = line.match(/[\d.,]+/g);
+      let numbers = line.match(buildNominalTokenRegex());
       if ((!numbers || numbers.length === 0) && lines[i + 1]) {
-        numbers = lines[i + 1].match(/[\d.,]+/g);
+        numbers = lines[i + 1].match(buildNominalTokenRegex());
       }
       if (numbers && numbers.length > 0) {
         const parsed = parseNominal(numbers[numbers.length - 1]);
@@ -208,9 +225,9 @@ function parseWithRegex(lines) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (totalKeywords.test(line)) {
-      let numbers = line.match(/[\d.,]+/g);
+      let numbers = line.match(buildNominalTokenRegex());
       if ((!numbers || numbers.length === 0) && lines[i + 1]) {
-        numbers = lines[i + 1].match(/[\d.,]+/g);
+        numbers = lines[i + 1].match(buildNominalTokenRegex());
       }
       if (numbers && numbers.length > 0) {
         const parsed = parseNominal(numbers[numbers.length - 1]);

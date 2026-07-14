@@ -21,7 +21,12 @@
 //        b. Cari SEMUA angka nominal di sisa teks itu — angka yang
 //           langsung diikuti huruf (mis. "600ML", "85GR", "20S") TIDAK
 //           dianggap nominal, karena itu satuan/ukuran produk, bukan
-//           harga/qty.
+//           harga/qty. Baris yang mengandung pola kode/ukuran produk
+//           (mis. "30 X 40 X 50 CM", "DB012-XYZ") malah dilewati SELURUH
+//           barisnya dari ekstraksi nominal (lihat hasProductCodePattern),
+//           karena angka di dalam kode semacam itu bisa tidak menempel
+//           huruf secara langsung (dipisah spasi/strip) sehingga lolos
+//           dari filter per-token biasa.
 //        c. 1 angka -> itu harga, sisa teks (setelah angka dibuang) -> nama.
 //        d. >=2 angka -> angka PALING KANAN = harga (line total), angka
 //           kecil (<=100) di posisi lain (biasanya paling kiri) -> qty.
@@ -32,46 +37,31 @@
 //           berikutnya (row yang isinya cuma angka).
 //   4. Nama dibersihkan dari sisa qty marker dan dirapikan.
 
-const { normalizeText, parseNominal } = require('./normalizer');
+const { normalizeText, parseNominal, buildNominalTokenRegex } = require('./normalizer');
+const { buildNonDataRegex } = require('./nonDataRows');
 
 // ─── Regex non-item (row yang harus DIABAIKAN, bukan item) ───────────────
 
-const NON_ITEM_REGEX = new RegExp(
-  [
-    'TOTAL', 'SUBTOTAL', 'GRAND\\s*TOTAL',
-    'TAX', 'PPN', 'PAJAK', 'SERVICE\\s*CHARGE',
-    'DISCOUNT', 'DISKON', 'PROMO',
-    'CASH', 'TUNAI', 'CHANGE', 'KEMBALI', 'PEMBAYARAN', 'PAYMENT',
-    'DATE', 'TANGGAL', 'TGL', 'TIME', 'JAM',
-    'NO\\.?\\s*(STRUK|TRANSAKSI|FAKTUR|INVOICE|REF)',
-    'RECEIPT', 'INVOICE', 'FAKTUR',
-    'KASIR', 'CASHIER', 'OPERATOR',
-    'TERIMA\\s*KASIH', 'THANK\\s*YOU', 'SELAMAT', 'WELCOME',
-    'QTY', 'HARGA\\s*SATUAN', '^ITEM$', '^NAMA$',
-    'NPWP', 'ALAMAT', 'TELP', 'PHONE',
-    // Baris alamat/kontak (mis. "Jl. Sudirman No. 123") sering lolos jadi
-    // "nama item + harga" palsu karena mengandung digit tanpa keyword
-    // transaksi apa pun. Dikecualikan di sini, konsisten dengan
-    // NON_STORE_REGEX di storeParser.js.
-    'JL\\.?\\s', 'JALAN\\s', 'RT\\s*\\d', 'RW\\s*\\d',
-    'KEC\\.?\\s', 'KECAMATAN', 'KAB\\.?\\s', 'KABUPATEN', 'KOTA\\s', 'PROVINSI',
-    'KODE\\s*POS', 'KELURAHAN', 'DESA\\s',
-    'TELEPON', '\\bHP\\b', '\\bWA\\b', 'WHATSAPP', 'FAX',
-  ].join('|'),
-  'i'
-);
+// Basis pola diambil dari nonDataRows.js (sama persis dipakai storeParser.js
+// & regexFallbackParser.js), ditambah beberapa label kolom yang HANYA
+// relevan untuk konteks daftar item (bukan area umum seperti alamat/toko).
+const NON_ITEM_REGEX = buildNonDataRegex([
+  'SERVICE\\s*CHARGE',
+  'PEMBAYARAN',
+  'HARGA\\s*SATUAN',
+  '^ITEM$',
+  '^NAMA$',
+  '\\bALAMAT\\b',
+]);
 
-// Pola angka nominal. PENTING:
-//   - lookbehind `(?<![A-Za-z0-9])` dan lookahead `(?![A-Za-z0-9])` memeriksa
-//     karakter yang LANGSUNG menempel (tanpa spasi) di kedua sisi angka.
-//   - Ini menolak angka yang menyatu dengan huruf sebagai satuan/ukuran
-//     produk (mis. "600ML", "85GR", "20S") ATAU sebagai bagian kode
-//     alfanumerik (mis. "A1234").
-//   - TIDAK memakai `\s*` di lookahead (beda dari versi awal yang salah),
-//     supaya angka yang dipisah SPASI dari kata berikutnya (mis. qty
-//     kolom "2  Kopi Susu Aren") tetap dianggap token angka yang valid.
+// Pola angka nominal. Sumbernya sekarang di normalizer.js (buildNominalTokenRegex),
+// dipakai bersama regexFallbackParser.js — sudah mendukung pemisah ribuan
+// berupa titik, koma, MAUPUN satu spasi (mis. "14 000" -> satu token nominal
+// "14 000", bukan dua token terpisah "14" dan "000"). Detail lookbehind/
+// lookahead (menolak angka menyatu dengan huruf, mis. "600ML") dan alasan
+// kenapa satu spasi aman dipakai di sini dijelaskan di normalizer.js.
 function makeNominalRegex() {
-  return /(?<![A-Za-z0-9])(?:Rp\.?\s*)?\d[\d.,]*(?![A-Za-z0-9])/g;
+  return buildNominalTokenRegex();
 }
 
 // Marker qty inline dalam nama, mis. "Kopi Susu Aren x2" atau "2x Kopi Susu Aren".
@@ -82,6 +72,39 @@ const QTY_INLINE_REGEX = /(?:^|\s)(\d{1,3})\s*[xX]\s*(?=\s|$)|(?:^|\s)[xX]\s*(\d
 const MIN_ITEM_NAME_LENGTH = 2;
 const MAX_QTY_VALUE = 100;
 const MAX_WRAP_LINES = 3; // batas akumulasi baris nama yang wrap tanpa harga
+
+// ─── Deteksi baris kode produk / ukuran (rekomendasi #5) ──────────────────
+//
+// buildNominalTokenRegex() (normalizer.js) hanya menolak angka yang
+// MENEMPEL LANGSUNG ke huruf (mis. "600ML"). Itu tidak cukup untuk kode
+// ukuran/produk yang angkanya dipisah spasi/simbol dari huruf di
+// sekitarnya, mis. "30 X 40 X 50 CM" (angka "30"/"40"/"50" tidak menempel
+// huruf secara langsung, jadi masih lolos jadi nominal). Baris seperti
+// ini harus dianggap "bukan kandidat item numerik" SECARA UTUH, bukan
+// cuma membuang token angkanya satu-satu — supaya sisa angka acak di
+// baris yang sama (kalau ada) tidak salah dipasangkan jadi harga.
+
+// Pola ukuran/dimensi: MINIMAL 3 angka berturut yang dipisah x/*, mis.
+// "30x40x50", "30 X 40 X 50". Sengaja disyaratkan >=3 angka (bukan 2)
+// supaya tidak bentrok dengan pola qty x harga satuan ("2 x 30000") yang
+// cuma 2 angka.
+const DIMENSION_CODE_REGEX = /\d+\s*[xX*]\s*\d+\s*[xX*]\s*\d+/;
+
+// Pola kode produk alfanumerik dengan strip, mis. "DB012-XYZ", "SKU-4521-A".
+// Syarat dalam SATU token (tanpa spasi): ada strip, DAN minimal satu huruf,
+// DAN minimal satu digit — supaya nama item biasa yang kebetulan pakai
+// strip tanpa digit (mis. "Kopi-Susu") TIDAK ikut kena.
+const ALNUM_CODE_TOKEN_REGEX = /\b(?=[A-Za-z0-9-]*[A-Za-z])(?=[A-Za-z0-9-]*\d)[A-Za-z0-9]+-[A-Za-z0-9-]*\b/;
+
+/**
+ * Apakah baris ini mengandung pola kode produk/ukuran? Kalau ya, SELURUH
+ * baris ini bukan kandidat sumber harga/qty numerik — diperlakukan sama
+ * seperti baris nama tanpa angka (bisa jadi bagian wrap nama item),
+ * bukan diproses lewat extractAllNominals().
+ */
+function hasProductCodePattern(text) {
+  return DIMENSION_CODE_REGEX.test(text) || ALNUM_CODE_TOKEN_REGEX.test(text);
+}
 
 // ─── Util ──────────────────────────────────────────────────────────────────
 
@@ -188,10 +211,17 @@ function findItemsEndIndex(rows) {
  * Ekstrak daftar item dari rows hasil groupLines().
  *
  * @param {Array<Row>} rows
- * @param {{startIndex?:number, endIndex?:number}} options
+ * @param {{startIndex?:number, endIndex?:number, excludeIndices?:Iterable<number>}} options
  *   startIndex/endIndex opsional — dipakai coordinateParser.js untuk
  *   membatasi area scan kalau storeParser/dateParser sudah tahu di mana
  *   header berakhir. Kalau tidak diberikan, dideteksi otomatis.
+ *   excludeIndices opsional — index baris (relatif ke `rows`) yang SUDAH
+ *   "diklaim" parser lain (mis. storeParser.claimedIndices, dateParser
+ *   match index). Baris ini dilewati SELALU, walau lolos dari
+ *   NON_ITEM_REGEX — supaya nama toko/tanggal yang kebetulan tidak
+ *   mengandung keyword apa pun (mis. cuma "GEDUNG SENTRA 2") tidak jadi
+ *   item palsu. Lihat rekomendasi #1: exclude berbasis posisi, bukan
+ *   cuma kata kunci.
  * @returns {Array<{name:string, price:number, quantity:number|null, raw:string}>}
  */
 function parseItems(rows, options = {}) {
@@ -199,6 +229,7 @@ function parseItems(rows, options = {}) {
 
   const endIndex = options.endIndex ?? findItemsEndIndex(rows);
   const startIndex = options.startIndex ?? 0;
+  const excludeIndices = new Set(options.excludeIndices ?? []);
 
   const items = [];
   // pendingName menampung nama yang belum dapat harga (bisa hasil akumulasi
@@ -210,6 +241,14 @@ function parseItems(rows, options = {}) {
   };
 
   for (let i = startIndex; i < endIndex; i++) {
+    if (excludeIndices.has(i)) {
+      // Baris ini sudah dipastikan milik field lain (nama toko/tanggal)
+      // oleh coordinateParser.js — skip tanpa syarat, jangan andalkan
+      // regex kata kunci yang bisa meleset.
+      resetPending();
+      continue;
+    }
+
     const row = rows[i];
     const rawText = normalizeText(row.text);
 
@@ -221,6 +260,26 @@ function parseItems(rows, options = {}) {
     }
 
     const { text: textNoQty, inlineQty } = extractInlineQty(rawText);
+
+    // Rekomendasi #5: baris kode produk/ukuran (mis. "30 X 40 X 50 CM",
+    // "DB012-XYZ") TIDAK boleh dipecah per-token angka — seluruh baris
+    // langsung dianggap bukan kandidat numerik, diperlakukan sama seperti
+    // baris nama tanpa angka (bisa diakumulasi sebagai wrap ke pendingName).
+    // Dicek dari rawText (bukan textNoQty) supaya pola "x"/"*" pada kode
+    // ukuran tidak keburu "dimakan" oleh extractInlineQty().
+    if (hasProductCodePattern(rawText)) {
+      const codeName = cleanItemName(textNoQty);
+      if (codeName.length >= MIN_ITEM_NAME_LENGTH) {
+        if (pendingName && pendingName.nameParts.length < MAX_WRAP_LINES) {
+          pendingName.nameParts.push(codeName);
+          pendingName.rawParts.push(rawText);
+        } else {
+          pendingName = { nameParts: [codeName], rawParts: [rawText], inlineQty: null };
+        }
+      }
+      continue;
+    }
+
     const nominals = extractAllNominals(textNoQty);
 
     if (nominals.length === 0) {
@@ -298,4 +357,5 @@ module.exports = {
   findItemsEndIndex,
   extractAllNominals,
   isNonItemRow,
+  hasProductCodePattern,
 };

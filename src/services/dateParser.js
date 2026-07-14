@@ -130,7 +130,7 @@ function parseDate(rows) {
     const partsInRow = extractDateParts(row.text);
     if (partsInRow) {
       const result = buildDateResult(partsInRow, row.text);
-      if (result) return result;
+      if (result) return { ...result, lineIndices: [labelMatch.index] };
     }
 
     // 1b. Coba ambil dari token-token di kanan label (kalau formatnya
@@ -142,7 +142,7 @@ function parseDate(rows) {
       const partsRight = extractDateParts(rightText);
       if (partsRight) {
         const result = buildDateResult(partsRight, rightText);
-        if (result) return result;
+        if (result) return { ...result, lineIndices: [labelMatch.index] };
       }
     }
 
@@ -153,18 +153,27 @@ function parseDate(rows) {
       const parts = extractDateParts(r.text);
       if (parts) {
         const result = buildDateResult(parts, r.text);
-        if (result) return result;
+        if (result) {
+          // r adalah referensi objek yang sama dengan salah satu elemen
+          // `rows`, jadi indexOf() aman dipakai untuk balik ke posisi asli.
+          const valueIndex = rows.indexOf(r);
+          const lineIndices = valueIndex >= 0
+            ? [labelMatch.index, valueIndex]
+            : [labelMatch.index];
+          return { ...result, lineIndices };
+        }
       }
     }
   }
 
   // 2. Tidak ada label eksplisit (atau label ada tapi value tak ketemu) —
   //    scan semua row untuk pola tanggal generik.
-  for (const row of rows) {
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
     const parts = extractDateParts(row.text);
     if (parts) {
       const result = buildDateResult(parts, row.text);
-      if (result) return result;
+      if (result) return { ...result, lineIndices: [i] };
     }
   }
 

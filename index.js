@@ -35,11 +35,16 @@ app.use('/api',              notificationRoutes);
 app.use('/api/report',       reportRoutes);
 app.use('/api/approval',     approvalRoutes);
 app.use('/api/ocr',          ocrRoutes);
-app.use('/api/cnn',          cnnRoutes);  // ← tambah
+app.use('/api/cnn',          cnnRoutes);
 
 // Health check
 app.get('/api', (req, res) => {
   res.json({ message: 'Reimburse API is running ✅' });
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({ message: 'Reimburse API root. Gunakan /api untuk endpoint utama.' });
 });
 
 // 404 handler
